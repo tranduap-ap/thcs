@@ -15,7 +15,7 @@ import { ClassSettingsModal } from './components/ClassSettingsModal';
 import { AuthModal } from './components/AuthModal';
 import { AccountManagerModal } from './components/AccountManagerModal';
 
-import {
+import type {
   Student,
   StudentWeeklyRecord,
   MorningDutyRecord,
@@ -30,9 +30,60 @@ import {
   loadAppState,
   saveAppState,
   resetToInitialData,
-  AppState,
+  type AppState,
 } from './utils/storage';
-import { calculateGroupSummaries, calculateStudentScore } from './utils/scoring';
+import { calculateGroupSummaries } from './utils/scoring';
+
+// ============================================================================
+// CẤU HÌNH ĐỒNG BỘ ĐÁM MÂY FIREBASE (PROJECT: trang-90cbb)
+// ============================================================================
+const CANDIDATE_URLS = [
+  'https://trang-90cbb-default-rtdb.asia-southeast1.firebasedatabase.app',
+  'https://trang-90cbb-default-rtdb.firebaseio.com',
+];
+
+let activeFirebaseUrl = CANDIDATE_URLS[0];
+let isSyncingFromCloud = false;
+let lastSyncedTimestamp = 0;
+
+async function resolveFirebaseUrl(): Promise<string> {
+  for (const url of CANDIDATE_URLS) {
+    try {
+      const res = await fetch(`${url}/thcs_nenep_data.json`, { method: 'GET' });
+      if (res.ok) {
+        activeFirebaseUrl = url;
+        return url;
+      }
+    } catch {
+      // Thử link tiếp theo
+    }
+  }
+  return activeFirebaseUrl;
+}
+
+async function syncToCloud(stateToSync: AppState) {
+  if (isSyncingFromCloud) return;
+  try {
+    const now = Date.now();
+    lastSyncedTimestamp = now;
+
+    // Không đẩy phiên đăng nhập cá nhân (currentUserRole/currentAccountId) đè lên máy người khác
+    const { currentUserRole, currentAccountId, ...sharedData } = stateToSync;
+
+    const payload = {
+      appData: sharedData,
+      updatedAt: now,
+    };
+
+    await fetch(`${activeFirebaseUrl}/thcs_nenep_data.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error('Lỗi lưu đám mây Firebase (trang-90cbb):', err);
+  }
+}
 
 export default function App() {
   const [appState, setAppState] = useState<AppState>(() => loadAppState());
@@ -49,23 +100,86 @@ export default function App() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isAccountManagerOpen, setIsAccountManagerOpen] = useState(false);
 
-  // Auto save to localStorage when appState changes
+  // Lưu vào localStorage và tự động đẩy lên Firebase khi có thay đổi dữ liệu
   useEffect(() => {
     saveAppState(appState);
+    if (!isSyncingFromCloud) {
+      const timeout = setTimeout(() => {
+        syncToCloud(appState);
+      }, 300);
+      return () => clearTimeout(timeout);
+    }
   }, [appState]);
+
+  // Kích hoạt đồng bộ 2 chiều từ Firebase (trang-90cbb) mỗi 3 giây
+  useEffect(() => {
+    const pullFromCloud = async () => {
+      try {
+        const res = await fetch(`${activeFirebaseUrl}/thcs_nenep_data.json`);
+        if (!res.ok) return;
+        const cloudData = await res.json();
+
+        if (!cloudData || !cloudData.appData) {
+          await syncToCloud(loadAppState());
+          return;
+        }
+
+        if (cloudData.updatedAt && cloudData.updatedAt > lastSyncedTimestamp) {
+          lastSyncedTimestamp = cloudData.updatedAt;
+          isSyncingFromCloud = true;
+
+          const remote = cloudData.appData;
+          setAppState((prev) => {
+            const merged: AppState = {
+              ...prev,
+              metadata: remote.metadata || prev.metadata,
+              students: Array.isArray(remote.students) ? remote.students : prev.students,
+              weeks: Array.isArray(remote.weeks) ? remote.weeks : prev.weeks,
+              currentWeekId: remote.currentWeekId ?? prev.currentWeekId,
+              accounts: Array.isArray(remote.accounts) ? remote.accounts : prev.accounts,
+              weeklyRecords: remote.weeklyRecords || {},
+              morningDutyRecords: Array.isArray(remote.morningDutyRecords) ? remote.morningDutyRecords : [],
+              afternoonRecords: Array.isArray(remote.afternoonRecords) ? remote.afternoonRecords : [],
+              weeklyRemarks: remote.weeklyRemarks || prev.weeklyRemarks,
+            };
+            saveAppState(merged);
+            return merged;
+          });
+
+          setTimeout(() => {
+            isSyncingFromCloud = false;
+          }, 400);
+        }
+      } catch (err) {
+        console.error('Lỗi tải dữ liệu từ Firebase (trang-90cbb):', err);
+      }
+    };
+
+    resolveFirebaseUrl().then(() => {
+      pullFromCloud();
+    });
+
+    const timer = setInterval(() => {
+      if (!isSyncingFromCloud) {
+        pullFromCloud();
+      }
+    }, 3000);
+
+    return () => clearInterval(timer);
+  }, []);
 
   const {
     metadata,
-    students,
-    weeks,
+    students = [],
+    weeks = [],
     currentWeekId,
     currentUserRole,
     currentAccountId,
-    accounts,
-    weeklyRecords,
-    morningDutyRecords,
-    afternoonRecords,
-    weeklyRemarks,
+    accounts = [],
+    weeklyRecords = {},
+    morningDutyRecords = [],
+    afternoonRecords = [],
+    weeklyRemarks = {},
   } = appState;
 
   // Tài khoản đang đăng nhập (hoặc undefined nếu đã đăng xuất)
@@ -84,8 +198,9 @@ export default function App() {
     }));
   };
 
-  // Lấy dữ liệu tuần hiện tại
-  const currentWeek = weeks.find((w) => w.id === currentWeekId) || weeks[0];
+  // Lấy dữ liệu tuần hiện tại an toàn (tránh lỗi undefined.name làm trắng trang)
+  const currentWeek: WeekInfo = weeks.find((w) => w.id === currentWeekId) ||
+    weeks[0] || { id: 4, name: 'Tuần 4', startDate: '', endDate: '' };
   const currentRecords = weeklyRecords[currentWeekId] || {};
 
   // Tính kết quả thi đua 6 nhóm
@@ -126,7 +241,6 @@ export default function App() {
     setAppState((prev) => ({
       ...prev,
       currentWeekId: weekId,
-      // Nếu tuần chưa có records thì khởi tạo
       weeklyRecords: {
         ...prev.weeklyRecords,
         [weekId]: prev.weeklyRecords[weekId] || {},
@@ -192,7 +306,6 @@ export default function App() {
     const student = students.find((s) => s.id === studentId);
     if (!student) return;
 
-    // Cập nhật bảng tuần
     setAppState((prev) => {
       const weekRecs = { ...(prev.weeklyRecords[prev.currentWeekId] || {}) };
       const currentStudentRec: StudentWeeklyRecord = weekRecs[studentId] || {
@@ -222,13 +335,16 @@ export default function App() {
       weekRecs[studentId] = {
         ...currentStudentRec,
         [field]: newVal,
-        note: note ? (currentStudentRec.note ? `${currentStudentRec.note}; ${note}` : note) : currentStudentRec.note,
+        note: note
+          ? currentStudentRec.note
+            ? `${currentStudentRec.note}; ${note}`
+            : note
+          : currentStudentRec.note,
       };
 
-      let newMorning = [...prev.morningDutyRecords];
-      let newAfternoon = [...prev.afternoonRecords];
+      let newMorning = [...(prev.morningDutyRecords || [])];
+      let newAfternoon = [...(prev.afternoonRecords || [])];
 
-      // Nếu chọn 15p đầu giờ -> tự động ghi vào Morning Duty
       if (context === 'morning') {
         const morningRec: MorningDutyRecord = {
           id: `md-${Date.now()}`,
@@ -248,7 +364,6 @@ export default function App() {
         newMorning.unshift(morningRec);
       }
 
-      // Nếu chọn trái buổi -> tự động ghi vào Afternoon
       if (context === 'afternoon') {
         const afternoonRec: AfternoonRecord = {
           id: `an-${Date.now()}`,
@@ -292,7 +407,6 @@ export default function App() {
     };
 
     setAppState((prev) => {
-      // Tự động đồng bộ vào bảng nề nếp tuần
       const weekRecs = { ...(prev.weeklyRecords[prev.currentWeekId] || {}) };
       const currentStudentRec: StudentWeeklyRecord = weekRecs[rec.studentId] || {
         studentId: rec.studentId,
@@ -343,7 +457,7 @@ export default function App() {
           ...prev.weeklyRecords,
           [prev.currentWeekId]: weekRecs,
         },
-        morningDutyRecords: [newRecord, ...prev.morningDutyRecords],
+        morningDutyRecords: [newRecord, ...(prev.morningDutyRecords || [])],
       };
     });
   };
@@ -351,7 +465,7 @@ export default function App() {
   const handleDeleteMorningRecord = (id: string) => {
     setAppState((prev) => ({
       ...prev,
-      morningDutyRecords: prev.morningDutyRecords.filter((r) => r.id !== id),
+      morningDutyRecords: (prev.morningDutyRecords || []).filter((r) => r.id !== id),
     }));
   };
 
@@ -364,7 +478,6 @@ export default function App() {
     };
 
     setAppState((prev) => {
-      // Tự động đồng bộ vào bảng tuần
       const weekRecs = { ...(prev.weeklyRecords[prev.currentWeekId] || {}) };
       const currentStudentRec: StudentWeeklyRecord = weekRecs[rec.studentId] || {
         studentId: rec.studentId,
@@ -415,7 +528,7 @@ export default function App() {
           ...prev.weeklyRecords,
           [prev.currentWeekId]: weekRecs,
         },
-        afternoonRecords: [newRecord, ...prev.afternoonRecords],
+        afternoonRecords: [newRecord, ...(prev.afternoonRecords || [])],
       };
     });
   };
@@ -423,7 +536,7 @@ export default function App() {
   const handleDeleteAfternoonRecord = (id: string) => {
     setAppState((prev) => ({
       ...prev,
-      afternoonRecords: prev.afternoonRecords.filter((r) => r.id !== id),
+      afternoonRecords: (prev.afternoonRecords || []).filter((r) => r.id !== id),
     }));
   };
 
@@ -468,11 +581,11 @@ export default function App() {
   const handleResetData = () => {
     const initial = resetToInitialData();
     setAppState(initial);
+    syncToCloud(initial);
   };
 
   const handleApplyNewRoster = (newStudents: Student[]) => {
     setAppState((prev) => {
-      // Đồng bộ nạp danh sách học sinh mới
       const newWeeklyRecords = { ...prev.weeklyRecords };
       const currentWeekRecs: Record<string, StudentWeeklyRecord> = {};
 
